@@ -2,10 +2,13 @@
 from flask import Flask, request, jsonify
 import requests
 
+from validate import validate_input, detect_injection, scan_output
+
 app = Flask(__name__)
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "llama3.2:1b"
+
 
 @app.route("/")
 def home():
@@ -37,31 +40,66 @@ def home():
             const data = await result.json();
 
             document.getElementById("response").textContent =
-                data.response;
+                data.response || data.error;
         }
         </script>
     </body>
     </html>
     """
 
+
 @app.route("/chat", methods=["POST"])
 def chat():
-    user_message = request.json.get("message", "")
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": MODEL,
-            "messages": [
-                {"role": "user", "content": user_message}
-            ],
-            "stream": False
-        }
-    )
+    # Layer 1: Input validation
+    data = request.get_json(silent=True) or {}
+    user_message = data.get("message", "")
 
-    ai_response = response.json()["message"]["content"]
+    valid, validation_message = validate_input(user_message)
+
+    if not valid:
+        return jsonify({"error": validation_message}), 400
+
+    # Layer 2: Prompt injection detection
+    detected, detection_message = detect_injection(user_message)
+
+    if detected:
+        return jsonify({
+            "error": "Request blocked by prompt injection defence."
+        }), 400
+
+    # Send accepted prompt to Ollama
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "user", "content": user_message}
+                ],
+                "stream": False
+            },
+            timeout=120
+        )
+
+        response.raise_for_status()
+        ai_response = response.json()["message"]["content"]
+
+    except (requests.RequestException, KeyError, ValueError):
+        return jsonify({
+            "error": "Unable to obtain a response from Ollama."
+        }), 502
+
+    # Layer 3: Output scanning
+    suspicious, scan_message = scan_output(ai_response)
+
+    if suspicious:
+        return jsonify({
+            "response": "Response blocked by output security scanner."
+        })
 
     return jsonify({"response": ai_response})
+
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000)
